@@ -231,11 +231,23 @@ func buildTag(object, typ, tag, tagger, message string) []byte {
 
 // ---------- pkt-line ----------
 
-// pktLine encodes one pkt-line (4 hex length + payload).
+// pktLine encodes one pkt-line (4 hex length + payload). The length is
+// formatted by hand: fmt.Sprintf("%04x") costs ~300ns per call via
+// reflection, and a fetch response builds several pkt-lines.
 func pktLine(payload []byte) []byte {
 	total := len(payload) + 4
 	out := make([]byte, 4, total)
-	copy(out, fmt.Sprintf("%04x", total))
+	if total >= 65536 {
+		// never happens in practice (max pkt-line is 65520); keep the
+		// general path for safety.
+		copy(out, fmt.Sprintf("%04x", total))
+		return append(out, payload...)
+	}
+	const hexd = "0123456789abcdef"
+	out[0] = hexd[(total>>12)&0xf]
+	out[1] = hexd[(total>>8)&0xf]
+	out[2] = hexd[(total>>4)&0xf]
+	out[3] = hexd[total&0xf]
 	return append(out, payload...)
 }
 

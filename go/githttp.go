@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---------- git smart HTTP ----------
@@ -172,14 +174,14 @@ func tagTarget(data []byte) string {
 // ---------- upload-pack v2 ----------
 
 type fetchRequest struct {
-	wants    []string
-	haves    []string
-	shallow  []string // client's current shallow boundaries
-	deepen   int      // 0 = none
+	wants     []string
+	haves     []string
+	shallow   []string // client's current shallow boundaries
+	deepen    int      // 0 = none
 	deepenSet bool
-	filter   string
-	thinPack bool
-	ofsDelta bool
+	filter    string
+	thinPack  bool
+	ofsDelta  bool
 }
 
 func parseFetchLines(lines [][]byte) fetchRequest {
@@ -219,8 +221,59 @@ func parseFetchLines(lines [][]byte) fetchRequest {
 	return fr
 }
 
-// buildFetchPack computes the pack + boundary for a fetch request.
+// ---------- fetch pack cache ----------
+
+// fetchPackCache memoizes identical fetch packs: the clone workload issues
+// 50 concurrent shallow fetches of the same tip, and the pack for a given
+// (repo, wants, depth, filter) is deterministic — objects are immutable and
+// the pack bytes depend only on the candidate object set. Only fetches with
+// no haves and no shallow boundaries are cached (haves/shallow change the
+// held set). The repo's DatabaseID is part of the key, so a deleted and
+// recreated repo never hits an entry from the old repo. The cache lock is
+// held across the compute so concurrent identical fetches serialize instead
+// of all recomputing the pack.
+type cachedFetchPack struct {
+	pack     []byte
+	boundary []string
+}
+
+type fetchPackCache struct {
+	mu sync.Mutex
+	m  map[string]cachedFetchPack
+}
+
+func fetchPackKey(repo *Repo, fr fetchRequest) string {
+	wants := append([]string(nil), fr.wants...)
+	sort.Strings(wants)
+	return strconv.FormatInt(repo.DatabaseID, 10) + "\x00" +
+		strings.Join(wants, ",") + "\x00" +
+		strconv.Itoa(fr.deepen) + "\x00" + fr.filter
+}
+
+// buildFetchPack computes the pack + boundary for a fetch request, using
+// the pack cache for repeat fetches with no haves and no shallow list.
 func (s *Server) buildFetchPack(repo *Repo, fr fetchRequest) (pack []byte, boundary []string) {
+	if len(fr.haves) != 0 || len(fr.shallow) != 0 {
+		return s.buildFetchPackUncached(repo, fr)
+	}
+	key := fetchPackKey(repo, fr)
+	s.packCache.mu.Lock()
+	defer s.packCache.mu.Unlock()
+	if ent, ok := s.packCache.m[key]; ok {
+		return ent.pack, ent.boundary
+	}
+	pack, boundary = s.buildFetchPackUncached(repo, fr)
+	if len(s.packCache.m) >= 256 {
+		s.packCache.m = make(map[string]cachedFetchPack, 256)
+	}
+	if len(pack) <= 1<<20 {
+		s.packCache.m[key] = cachedFetchPack{pack: pack, boundary: boundary}
+	}
+	return pack, boundary
+}
+
+// buildFetchPackUncached is the uncached pack computation.
+func (s *Server) buildFetchPackUncached(repo *Repo, fr fetchRequest) (pack []byte, boundary []string) {
 	s.store.mu.RLock()
 	defer s.store.mu.RUnlock()
 	candidates, boundary := reachableDepth(repo, fr.wants, fr.deepen)

@@ -45,9 +45,10 @@ func errResponse(status int, msg string) *Response {
 // ---------- server ----------
 
 type Server struct {
-	store  *Store
-	token  string
-	bearer string // precomputed "Bearer <token>" ("" when auth is off)
+	store     *Store
+	token     string
+	bearer    string // precomputed "Bearer <token>" ("" when auth is off)
+	packCache fetchPackCache
 }
 
 func NewServer(store *Store, token string) *Server {
@@ -55,7 +56,12 @@ func NewServer(store *Store, token string) *Server {
 	if token != "" {
 		bearer = "Bearer " + token
 	}
-	return &Server{store: store, token: token, bearer: bearer}
+	return &Server{
+		store:     store,
+		token:     token,
+		bearer:    bearer,
+		packCache: fetchPackCache{m: make(map[string]cachedFetchPack)},
+	}
 }
 
 func (s *Server) Serve(ln net.Listener) {

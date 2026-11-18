@@ -96,6 +96,12 @@ func splitPath(p string) []string {
 	raw := strings.Split(p, "/")
 	out := make([]string, 0, len(raw))
 	for _, seg := range raw {
+		// Fast path: a segment with no '%' is returned unchanged by
+		// PathUnescape, so skip the call entirely.
+		if strings.IndexByte(seg, '%') < 0 {
+			out = append(out, seg)
+			continue
+		}
 		if u, err := url.PathUnescape(seg); err == nil {
 			out = append(out, u)
 		} else {

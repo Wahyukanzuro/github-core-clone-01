@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // ---------- REST v3 ----------
@@ -65,8 +67,21 @@ func (s *Server) withReqID(req *Request, resp *Response) *Response {
 	if resp.Headers == nil {
 		resp.Headers = map[string]string{}
 	}
-	resp.Headers["X-GitHub-Request-Id"] = nextRequestID()
+	resp.Headers["X-GitHub-Request-Id"] = nextRequestIDFast()
 	return resp
+}
+
+// nextRequestIDFast renders "req-%08x" without fmt.Sprintf.
+func nextRequestIDFast() string {
+	n := atomic.AddInt64(&reqCounter, 1)
+	var buf [12]byte
+	copy(buf[0:], "req-")
+	const hexd = "0123456789abcdef"
+	for i := 0; i < 8; i++ {
+		buf[11-i] = hexd[n&0xf]
+		n >>= 4
+	}
+	return string(buf[:])
 }
 
 func (s *Server) restErr(status int, msg string) *Response {
@@ -124,8 +139,36 @@ func repoJSON(r *Repo) J {
 	}
 }
 
-func issueJSON(iss *Issue, r *Repo) J {
-	labels := make([]interface{}, 0, len(iss.Labels))
+// issueJSON renders one issue. A typed struct marshals far faster than the
+// generic map the other renderers use, and the parsed JSON is identical.
+type issueLabelJSON struct {
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+}
+
+type issueUserJSON struct {
+	Login string `json:"login"`
+	ID    int64  `json:"id"`
+}
+
+type issueJSONOut struct {
+	ID        int64            `json:"id"`
+	Number    int              `json:"number"`
+	Title     string           `json:"title"`
+	Body      string           `json:"body"`
+	State     string           `json:"state"`
+	Labels    []issueLabelJSON `json:"labels"`
+	User      issueUserJSON    `json:"user"`
+	CreatedAt string           `json:"created_at"`
+	UpdatedAt string           `json:"updated_at"`
+	ClosedAt  interface{}      `json:"closed_at"`
+	Comments  int              `json:"comments"`
+	HTMLURL   string           `json:"html_url"`
+}
+
+func issueJSON(iss *Issue, r *Repo) issueJSONOut {
+	labels := make([]issueLabelJSON, 0, len(iss.Labels))
 	for _, name := range iss.Labels {
 		color := "ededed"
 		desc := ""
@@ -133,26 +176,38 @@ func issueJSON(iss *Issue, r *Repo) J {
 			color = l.Color
 			desc = l.Description
 		}
-		labels = append(labels, J{"name": name, "color": color, "description": desc})
+		labels = append(labels, issueLabelJSON{Name: name, Color: color, Description: desc})
 	}
 	closedAt := interface{}(nil)
 	if iss.ClosedAt != "" {
 		closedAt = iss.ClosedAt
 	}
-	return J{
-		"id":         iss.ID,
-		"number":     iss.Number,
-		"title":      iss.Title,
-		"body":       iss.Body,
-		"state":      iss.State,
-		"labels":     labels,
-		"user":       J{"login": iss.UserLogin, "id": iss.UserID},
-		"created_at": iss.CreatedAt,
-		"updated_at": iss.UpdatedAt,
-		"closed_at":  closedAt,
-		"comments":   len(iss.Comments),
-		"html_url":   "http://example.invalid/" + r.Owner + "/" + r.Name + "/issues/" + strconv.Itoa(iss.Number),
+	return issueJSONOut{
+		ID:        iss.ID,
+		Number:    iss.Number,
+		Title:     iss.Title,
+		Body:      iss.Body,
+		State:     iss.State,
+		Labels:    labels,
+		User:      issueUserJSON{Login: iss.UserLogin, ID: iss.UserID},
+		CreatedAt: iss.CreatedAt,
+		UpdatedAt: iss.UpdatedAt,
+		ClosedAt:  closedAt,
+		Comments:  len(iss.Comments),
+		HTMLURL:   "http://example.invalid/" + r.Owner + "/" + r.Name + "/issues/" + strconv.Itoa(iss.Number),
 	}
+}
+
+// getIssueFast finds an issue by number in O(1): issue numbers are dense
+// from 1 in creation order, so number n lives at index n-1; anything else
+// falls back to the linear scan.
+func getIssueFast(r *Repo, n int) *Issue {
+	if n >= 1 && n <= len(r.Issues) {
+		if iss := r.Issues[n-1]; iss.Number == n {
+			return iss
+		}
+	}
+	return r.getIssue(n)
 }
 
 func commentJSON(c *Comment, r *Repo, issueNum int) J {
@@ -806,14 +861,24 @@ func (s *Server) restListIssues(req *Request, repo *Repo) *Response {
 	return s.listResponse(req, items)
 }
 
+// createIssueBody is the typed decode for issue creation: a struct decode
+// avoids the generic map the other endpoints use.
+type createIssueBody struct {
+	Title  string   `json:"title"`
+	Body   string   `json:"body"`
+	Labels []string `json:"labels"`
+}
+
 func (s *Server) restCreateIssue(req *Request, repo *Repo) *Response {
-	body, ok := parseJSONBody(req.Body)
-	if !ok {
-		return s.restErr(400, "Problems parsing JSON")
+	var body createIssueBody
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &body); err != nil {
+			return s.restErr(400, "Problems parsing JSON")
+		}
 	}
-	title := strField(body, "title")
-	issueBody := strField(body, "body")
-	labels := strSliceField(body, "labels")
+	title := body.Title
+	issueBody := body.Body
+	labels := body.Labels
 	s.store.mu.Lock()
 	iss, badLabel := s.store.createIssue(repo, title, issueBody, labels)
 	s.store.mu.Unlock()
@@ -830,7 +895,7 @@ func (s *Server) restGetIssue(req *Request, repo *Repo, numStr string) *Response
 	}
 	s.store.mu.RLock()
 	defer s.store.mu.RUnlock()
-	iss := repo.getIssue(n)
+	iss := getIssueFast(repo, n)
 	if iss == nil {
 		return s.restErr(404, "Not Found")
 	}
@@ -847,7 +912,7 @@ func (s *Server) restPatchIssue(req *Request, repo *Repo, numStr string) *Respon
 		return s.restErr(400, "Problems parsing JSON")
 	}
 	s.store.mu.Lock()
-	iss := repo.getIssue(n)
+	iss := getIssueFast(repo, n)
 	if iss == nil {
 		s.store.mu.Unlock()
 		return s.restErr(404, "Not Found")
@@ -897,7 +962,7 @@ func (s *Server) restListComments(req *Request, repo *Repo, numStr string) *Resp
 	}
 	s.store.mu.RLock()
 	defer s.store.mu.RUnlock()
-	iss := repo.getIssue(n)
+	iss := getIssueFast(repo, n)
 	if iss == nil {
 		return s.restErr(404, "Not Found")
 	}
@@ -919,7 +984,7 @@ func (s *Server) restCreateComment(req *Request, repo *Repo, numStr string) *Res
 	}
 	commentBody := strField(body, "body")
 	s.store.mu.Lock()
-	iss := repo.getIssue(n)
+	iss := getIssueFast(repo, n)
 	if iss == nil {
 		s.store.mu.Unlock()
 		return s.restErr(404, "Not Found")

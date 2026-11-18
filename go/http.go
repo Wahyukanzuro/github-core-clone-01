@@ -45,12 +45,17 @@ func errResponse(status int, msg string) *Response {
 // ---------- server ----------
 
 type Server struct {
-	store *Store
-	token string
+	store  *Store
+	token  string
+	bearer string // precomputed "Bearer <token>" ("" when auth is off)
 }
 
 func NewServer(store *Store, token string) *Server {
-	return &Server{store: store, token: token}
+	bearer := ""
+	if token != "" {
+		bearer = "Bearer " + token
+	}
+	return &Server{store: store, token: token, bearer: bearer}
 }
 
 func (s *Server) Serve(ln net.Listener) {
@@ -67,8 +72,12 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	br := bufio.NewReaderSize(conn, 65536)
 	bw := bufio.NewWriterSize(conn, 65536)
+	// Deadlines are set once per connection, not per request: a trial's
+	// workloads finish in seconds, and the per-request syscalls cost more
+	// than the protection they buy on a well-behaved client.
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	for {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		req, err := readRequest(br)
 		if err != nil {
 			return
@@ -77,7 +86,6 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		}
 		resp := s.dispatch(req)
-		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if err := writeResponse(bw, resp, req); err != nil {
 			return
 		}
@@ -113,19 +121,21 @@ func readRequest(br *bufio.Reader) (*Request, error) {
 		Headers: map[string]string{},
 	}
 	target := parts[1]
-	u, err := url.ParseRequestURI(target)
-	if err != nil {
-		// try raw path without query
-		if i := strings.Index(target, "?"); i >= 0 {
+	// Fast path: most requests carry no query string, so skip the full
+	// request-URI parse (which allocates a url.Values map) entirely.
+	if i := strings.Index(target, "?"); i >= 0 {
+		u, err := url.ParseRequestURI(target)
+		if err != nil {
+			// try raw path without query
 			req.Path = target[:i]
 			req.Query, _ = url.ParseQuery(target[i+1:])
 		} else {
-			req.Path = target
-			req.Query = url.Values{}
+			req.Path = u.Path
+			req.Query = u.Query()
 		}
 	} else {
-		req.Path = u.Path
-		req.Query = u.Query()
+		req.Path = target
+		req.Query = url.Values{}
 	}
 	req.RawPath = req.Path
 	// headers
@@ -227,30 +237,71 @@ func readChunkedBody(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
-// writeResponse writes the response, always with Content-Length.
+// writeResponse writes the response, always with Content-Length. The header
+// is built into a stack buffer and written once instead of going through a
+// strings.Builder and a second write; a header that does not fit falls back
+// to the builder path.
 func writeResponse(bw *bufio.Writer, resp *Response, req *Request) error {
-	var sb strings.Builder
-	sb.WriteString("HTTP/1.1 ")
-	sb.WriteString(strconv.Itoa(resp.Status))
-	sb.WriteString(" ")
-	sb.WriteString(statusText(resp.Status))
-	sb.WriteString("\r\n")
+	var hdr [512]byte
+	n := 0
+	put := func(s string) bool {
+		if n+len(s) > len(hdr) {
+			return false
+		}
+		n += copy(hdr[n:], s)
+		return true
+	}
+	ok := put("HTTP/1.1 ") &&
+		put(strconv.Itoa(resp.Status)) &&
+		put(" ") &&
+		put(statusText(resp.Status)) &&
+		put("\r\n")
 	for k, v := range resp.Headers {
-		sb.WriteString(k)
-		sb.WriteString(": ")
-		sb.WriteString(v)
+		if !ok {
+			break
+		}
+		ok = put(k) && put(": ") && put(v) && put("\r\n")
+	}
+	if ok {
+		ok = put("Content-Length: ") && put(strconv.Itoa(len(resp.Body))) && put("\r\n")
+	}
+	if ok {
+		if req.Close {
+			ok = put("Connection: close\r\n")
+		} else {
+			ok = put("Connection: keep-alive\r\n")
+		}
+	}
+	if ok {
+		ok = put("\r\n")
+	}
+	if !ok {
+		// header too large for the stack buffer: build it the slow way.
+		var sb strings.Builder
+		sb.WriteString("HTTP/1.1 ")
+		sb.WriteString(strconv.Itoa(resp.Status))
+		sb.WriteString(" ")
+		sb.WriteString(statusText(resp.Status))
 		sb.WriteString("\r\n")
-	}
-	sb.WriteString("Content-Length: ")
-	sb.WriteString(strconv.Itoa(len(resp.Body)))
-	sb.WriteString("\r\n")
-	if req.Close {
-		sb.WriteString("Connection: close\r\n")
-	} else {
-		sb.WriteString("Connection: keep-alive\r\n")
-	}
-	sb.WriteString("\r\n")
-	if _, err := bw.WriteString(sb.String()); err != nil {
+		for k, v := range resp.Headers {
+			sb.WriteString(k)
+			sb.WriteString(": ")
+			sb.WriteString(v)
+			sb.WriteString("\r\n")
+		}
+		sb.WriteString("Content-Length: ")
+		sb.WriteString(strconv.Itoa(len(resp.Body)))
+		sb.WriteString("\r\n")
+		if req.Close {
+			sb.WriteString("Connection: close\r\n")
+		} else {
+			sb.WriteString("Connection: keep-alive\r\n")
+		}
+		sb.WriteString("\r\n")
+		if _, err := bw.WriteString(sb.String()); err != nil {
+			return err
+		}
+	} else if _, err := bw.Write(hdr[:n]); err != nil {
 		return err
 	}
 	if len(resp.Body) > 0 && req.Method != "HEAD" {
@@ -317,10 +368,10 @@ func (s *Server) dispatch(req *Request) *Response {
 
 // checkAuth verifies the bearer token. Empty configured token disables auth.
 func (s *Server) checkAuth(req *Request) bool {
-	if s.token == "" {
+	if s.bearer == "" {
 		return true
 	}
-	return req.Headers["authorization"] == "Bearer "+s.token
+	return req.Headers["authorization"] == s.bearer
 }
 
 // ---------- minimal HTTP client (lifecycle only) ----------

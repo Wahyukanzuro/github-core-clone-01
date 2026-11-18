@@ -5,20 +5,22 @@ import (
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---------- git object model ----------
 
 const (
-	ObjCommit = 1
-	ObjTree   = 2
-	ObjBlob   = 3
-	ObjTag    = 4
+	ObjCommit   = 1
+	ObjTree     = 2
+	ObjBlob     = 3
+	ObjTag      = 4
 	ObjOfsDelta = 6
 	ObjRefDelta = 7
 )
@@ -31,7 +33,8 @@ type Object struct {
 	Data []byte
 }
 
-// hashObject returns the SHA-1 id of an object.
+// hashObject returns the SHA-1 id of an object. It hashes the header and the
+// data in one streaming pass instead of copying the data behind a header.
 func hashObject(typ int, data []byte) string {
 	var typeName string
 	switch typ {
@@ -44,17 +47,21 @@ func hashObject(typ int, data []byte) string {
 	case ObjTag:
 		typeName = "tag"
 	}
-	hdr := fmt.Sprintf("%s %d\x00", typeName, len(data))
-	h := sha1Hex(append([]byte(hdr), data...))
-	return h
+	h := sha1.New()
+	h.Write([]byte(typeName))
+	h.Write([]byte(" "))
+	h.Write([]byte(strconv.Itoa(len(data))))
+	h.Write([]byte{0})
+	h.Write(data)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ---------- tree ----------
 
 type TreeEntry struct {
-	Mode string // "100644", "100755", "40000", "120000", "160000"
-	Name string
-	OID  string
+	Mode  string // "100644", "100755", "40000", "120000", "160000"
+	Name  string
+	OID   string
 	IsDir bool
 }
 
@@ -87,7 +94,7 @@ func parseTree(data []byte) []TreeEntry {
 		}
 		name := string(data[i : i+nul])
 		i += nul + 1
-		oid := fmt.Sprintf("%x", data[i:i+20])
+		oid := hex.EncodeToString(data[i : i+20])
 		i += 20
 		out = append(out, TreeEntry{Mode: mode, Name: name, OID: oid, IsDir: mode == "40000"})
 	}
@@ -107,10 +114,7 @@ func buildTree(entries []TreeEntry) []byte {
 		buf.WriteString(e.Name)
 		buf.WriteByte(0)
 		oidBytes := make([]byte, 20)
-		for k := 0; k < 20; k++ {
-			v, _ := strconv.ParseUint(e.OID[k*2:k*2+2], 16, 8)
-			oidBytes[k] = byte(v)
-		}
+		hex.Decode(oidBytes, []byte(e.OID))
 		buf.Write(oidBytes)
 	}
 	return buf.Bytes()
@@ -119,10 +123,7 @@ func buildTree(entries []TreeEntry) []byte {
 // hexToBytes converts a 40-hex oid to 20 bytes.
 func hexToBytes(oid string) []byte {
 	out := make([]byte, 20)
-	for k := 0; k < 20 && k*2+2 <= len(oid); k++ {
-		v, _ := strconv.ParseUint(oid[k*2:k*2+2], 16, 8)
-		out[k] = byte(v)
-	}
+	hex.Decode(out, []byte(oid))
 	return out
 }
 
@@ -137,31 +138,37 @@ type CommitInfo struct {
 	AuthorTS  int64
 }
 
-// parseCommit parses raw commit bytes.
+// parseCommit parses raw commit bytes without copying the whole object to a
+// string: it scans the header lines in place.
 func parseCommit(data []byte) CommitInfo {
 	var c CommitInfo
-	s := string(data)
 	// headers end at blank line
-	idx := strings.Index(s, "\n\n")
-	var head, msg string
+	idx := bytes.Index(data, []byte("\n\n"))
+	var head, msg []byte
 	if idx >= 0 {
-		head = s[:idx]
-		msg = s[idx+2:]
+		head = data[:idx]
+		msg = data[idx+2:]
 	} else {
-		head = s
+		head = data
 	}
-	c.Message = msg
-	for _, line := range strings.Split(head, "\n") {
+	c.Message = string(msg)
+	for len(head) > 0 {
+		var line []byte
+		if nl := bytes.IndexByte(head, '\n'); nl >= 0 {
+			line, head = head[:nl], head[nl+1:]
+		} else {
+			line, head = head, nil
+		}
 		switch {
-		case strings.HasPrefix(line, "tree "):
-			c.Tree = strings.TrimSpace(line[5:])
-		case strings.HasPrefix(line, "parent "):
-			c.Parents = append(c.Parents, strings.TrimSpace(line[7:]))
-		case strings.HasPrefix(line, "author "):
-			c.Author = strings.TrimSpace(line[7:])
+		case bytes.HasPrefix(line, []byte("tree ")):
+			c.Tree = strings.TrimSpace(string(line[5:]))
+		case bytes.HasPrefix(line, []byte("parent ")):
+			c.Parents = append(c.Parents, strings.TrimSpace(string(line[7:])))
+		case bytes.HasPrefix(line, []byte("author ")):
+			c.Author = strings.TrimSpace(string(line[7:]))
 			c.AuthorTS = parseIdentTS(c.Author)
-		case strings.HasPrefix(line, "committer "):
-			c.Committer = strings.TrimSpace(line[10:])
+		case bytes.HasPrefix(line, []byte("committer ")):
+			c.Committer = strings.TrimSpace(string(line[10:]))
 		}
 	}
 	return c
@@ -329,6 +336,10 @@ func (c *countingReader) ReadByte() (byte, error) {
 	return b, err
 }
 
+// zlibReaderPool reuses zlib readers across pack entries: a fresh reader pays
+// setup cost per stream, which dominates inflating small objects.
+var zlibReaderPool sync.Pool
+
 // readPack parses a pack file. Returns objects in pack order.
 // Verifies: magic, version 2, declared count, per-object inflated size,
 // and the 20-byte trailer checksum.
@@ -394,12 +405,23 @@ func readPack(data []byte) ([]Object, error) {
 		}
 		// zlib stream at pos; count consumed bytes
 		cr := &countingReader{r: bytes.NewReader(data[pos:])}
-		zr, err := zlib.NewReader(cr)
-		if err != nil {
-			return nil, fmt.Errorf("zlib open: %v", err)
+		var zr io.ReadCloser
+		var zerr error
+		if v := zlibReaderPool.Get(); v != nil {
+			zr = v.(io.ReadCloser)
+			zerr = zr.(zlib.Resetter).Reset(cr, nil)
+			if zerr != nil {
+				zr, zerr = zlib.NewReader(cr)
+			}
+		} else {
+			zr, zerr = zlib.NewReader(cr)
+		}
+		if zerr != nil {
+			return nil, fmt.Errorf("zlib open: %v", zerr)
 		}
 		inflated, err := io.ReadAll(zr)
 		zr.Close()
+		zlibReaderPool.Put(zr)
 		if err != nil {
 			return nil, fmt.Errorf("zlib inflate: %v", err)
 		}
@@ -424,6 +446,14 @@ func readPack(data []byte) ([]Object, error) {
 	return objs, nil
 }
 
+// zlibWriterPool reuses BestSpeed zlib writers across pack entries: a fresh
+// writer allocates large deflate tables per stream, which dominates the cost
+// of compressing small objects. Any zlib level is valid in a pack.
+var zlibWriterPool = sync.Pool{New: func() interface{} {
+	w, _ := zlib.NewWriterLevel(io.Discard, zlib.BestSpeed)
+	return w
+}}
+
 // writePack serializes objects into a pack file (plain entries, no deltas).
 func writePack(objs []Object) []byte {
 	var buf bytes.Buffer
@@ -434,9 +464,11 @@ func writePack(objs []Object) []byte {
 	buf.Write(hdr[:])
 	for _, o := range objs {
 		buf.Write(writePackObjectHeader(o.Type, len(o.Data)))
-		zw := zlib.NewWriter(&buf)
+		zw := zlibWriterPool.Get().(*zlib.Writer)
+		zw.Reset(&buf)
 		zw.Write(o.Data)
 		zw.Close()
+		zlibWriterPool.Put(zw)
 	}
 	sum := sha1.Sum(buf.Bytes())
 	buf.Write(sum[:])
